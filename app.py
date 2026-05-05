@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import io
 import json
 import re
@@ -28,6 +29,8 @@ DEFAULT_LOCAL_SESSION_NAME = "Session locale"
 CURRENT_EVENT_SESSION_KEY = "current_event_name"
 NEW_EVENT_OPTION = "__new_event__"
 PENDING_EVENT_SELECTION_KEY = "pending_selected_event_option"
+APP_PASSWORD_SECRET_KEY = "app_password"
+AUTHENTICATION_STATE_KEY = "password_authenticated"
 MEMBER_BASE_EDITOR_COLUMNS = ["Prénom", "Nom", "Nom complet", "Téléphone", "Âge", "Sexe", "Fonction"]
 MEMBER_BASE_MAPPING = {
     "first_name": "Prénom",
@@ -2187,9 +2190,45 @@ def build_follow_up_editor_frame(data: pd.DataFrame) -> pd.DataFrame:
     return editor.set_index("member_key")
 
 
+def get_configured_app_password() -> str:
+    """Retourne le mot de passe configuré dans les secrets Streamlit."""
+    password = st.secrets.get(APP_PASSWORD_SECRET_KEY, "")
+    return password.strip() if isinstance(password, str) else str(password).strip()
+
+
+def require_app_password() -> None:
+    """Bloque l'accès à l'application tant que le mot de passe n'est pas validé."""
+    configured_password = get_configured_app_password()
+    if not configured_password:
+        st.title("Suivi des réponses à des sondages WhatsApp")
+        st.error(
+            "Mot de passe non configuré. Ajoutez `app_password` dans les secrets Streamlit "
+            "avant de lancer l'application."
+        )
+        st.stop()
+
+    if st.session_state.get(AUTHENTICATION_STATE_KEY, False):
+        return
+
+    st.title("Accès protégé")
+    st.write("Saisissez le mot de passe pour ouvrir l'application.")
+    with st.form("password_gate"):
+        password = st.text_input("Mot de passe", type="password")
+        submitted = st.form_submit_button("Ouvrir l'application", use_container_width=True)
+
+    if submitted:
+        if hmac.compare_digest(password, configured_password):
+            st.session_state[AUTHENTICATION_STATE_KEY] = True
+            st.rerun()
+        st.error("Mot de passe incorrect.")
+
+    st.stop()
+
+
 def main() -> None:
     """Point d'entrée de l'application Streamlit."""
     st.set_page_config(page_title="Suivi des sondages WhatsApp", layout="wide")
+    require_app_password()
     initialize_database()
 
     saved_events = list_saved_events()
@@ -2213,6 +2252,11 @@ def main() -> None:
     )
 
     with st.sidebar:
+        if st.button("Verrouiller l'application", use_container_width=True):
+            st.session_state[AUTHENTICATION_STATE_KEY] = False
+            st.rerun()
+
+        st.divider()
         st.header("Base membres")
         if member_summary["count"]:
             st.caption(

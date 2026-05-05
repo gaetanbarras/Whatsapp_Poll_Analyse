@@ -43,6 +43,24 @@ streamlit run app.py
 
 L'application s'ouvre ensuite dans votre navigateur local.
 
+## Protection par mot de passe
+
+L'application attend un secret Streamlit nommé `app_password`.
+
+En local, créez le fichier `.streamlit/secrets.toml` :
+
+```toml
+app_password = "choisissez-un-mot-de-passe-solide"
+```
+
+Pour un déploiement sur Streamlit Community Cloud, ajoutez la même clé dans l'interface **App settings > Secrets** :
+
+```toml
+app_password = "choisissez-un-mot-de-passe-solide"
+```
+
+Le fichier `.streamlit/secrets.toml` ne doit pas être versionné.
+
 ## Formats attendus
 
 ### 1. Fichier de référence
