@@ -1,0 +1,54 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="DuplicatedCode" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <Languages>
+        <language minSize="56" name="Python" />
+      </Languages>
+    </inspection_tool>
+    <inspection_tool class="Eslint" enabled="true" level="WARNING" enabled_by_default="true" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="asgiref" />
+          <option value="beautifulsoup4" />
+          <option value="certifi" />
+          <option value="cffi" />
+          <option value="charset-normalizer" />
+          <option value="cryptography" />
+          <option value="defusedxml" />
+          <option value="diff-match-patch" />
+          <option value="Django" />
+          <option value="django-allauth" />
+          <option value="django-bootstrap4" />
+          <option value="django-crispy-forms" />
+          <option value="django-import-export" />
+          <option value="et-xmlfile" />
+          <option value="idna" />
+          <option value="MarkupPy" />
+          <option value="oauthlib" />
+          <option value="odfpy" />
+          <option value="openpyxl" />
+          <option value="Pillow" />
+          <option value="pycparser" />
+          <option value="PyJWT" />
+          <option value="PyPDF2" />
+          <option value="python3-openid" />
+          <option value="PyYAML" />
+          <option value="reportlab" />
+          <option value="requests" />
+          <option value="requests-oauthlib" />
+          <option value="soupsieve" />
+          <option value="sqlparse" />
+          <option value="tablib" />
+          <option value="urllib3" />
+          <option value="xlrd" />
+          <option value="xlwt" />
+          <option value="django-widget-tweaks" />
+          <option value="djangorestframework" />
+          <option value="djangorestframework_simplejwt" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
