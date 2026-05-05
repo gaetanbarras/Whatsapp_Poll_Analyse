@@ -19,6 +19,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from streamlit.errors import StreamlitSecretNotFoundError
 
 
 ANALYSIS_MODE_FREE = "Analyse libre"
@@ -2192,7 +2193,10 @@ def build_follow_up_editor_frame(data: pd.DataFrame) -> pd.DataFrame:
 
 def get_configured_app_password() -> str:
     """Retourne le mot de passe configuré dans les secrets Streamlit."""
-    password = st.secrets.get(APP_PASSWORD_SECRET_KEY, "")
+    try:
+        password = st.secrets.get(APP_PASSWORD_SECRET_KEY, "")
+    except StreamlitSecretNotFoundError:
+        return ""
     return password.strip() if isinstance(password, str) else str(password).strip()
 
 
@@ -2202,8 +2206,8 @@ def require_app_password() -> None:
     if not configured_password:
         st.title("Suivi des réponses à des sondages WhatsApp")
         st.error(
-            "Mot de passe non configuré. Ajoutez `app_password` dans les secrets Streamlit "
-            "avant de lancer l'application."
+            "Mot de passe non configuré. Ajoutez `app_password` dans `.streamlit/secrets.toml` "
+            "en local, ou dans `App settings > Secrets` sur Streamlit Community Cloud."
         )
         st.stop()
 
