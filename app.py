@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hmac
 import io
 import json
@@ -7,7 +8,8 @@ import re
 import sqlite3
 import unicodedata
 from contextlib import closing
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -26,12 +28,22 @@ ANALYSIS_MODE_FREE = "Analyse libre"
 ANALYSIS_MODE_CATEGORIZED = "Analyse catégorisée"
 MANUAL_CATEGORY_OPTIONS = ["Automatique", "Présent", "Absent", "Autre", "Pas de réponse"]
 DB_PATH = Path(__file__).resolve().parent / ".app_data" / "whatsapp_poll.db"
+SUPABASE_SCHEMA_PATH = Path(__file__).resolve().parent / "supabase_schema.sql"
 DEFAULT_LOCAL_SESSION_NAME = "Session locale"
 CURRENT_EVENT_SESSION_KEY = "current_event_name"
 NEW_EVENT_OPTION = "__new_event__"
 PENDING_EVENT_SELECTION_KEY = "pending_selected_event_option"
 APP_PASSWORD_SECRET_KEY = "app_password"
 AUTHENTICATION_STATE_KEY = "password_authenticated"
+DB_BACKEND_SQLITE = "sqlite"
+SUPABASE_SECRET_SECTION = "supabase"
+SUPABASE_DOCUMENTS_TABLE = "app_documents"
+SQLITE_MIGRATION_METADATA_KEY = "sqlite_migration_completed_supabase_documents_v1"
+SUPABASE_DOC_TYPE_EVENT_SESSION = "event_session"
+SUPABASE_DOC_TYPE_REFERENCE_SOURCE = "reference_source"
+SUPABASE_DOC_TYPE_MEMBER = "member"
+SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE = "event_member_override"
+SUPABASE_DOC_TYPE_METADATA = "app_metadata"
 MEMBER_BASE_EDITOR_COLUMNS = ["Prénom", "Nom", "Nom complet", "Téléphone", "Âge", "Sexe", "Fonction"]
 MEMBER_BASE_MAPPING = {
     "first_name": "Prénom",
@@ -282,136 +294,818 @@ def score_dataframe_quality(df: pd.DataFrame) -> int:
     return non_empty_headers * 100 + min(int(row_has_value.sum()), 50)
 
 
+@dataclass(frozen=True)
+class DatabaseConfig:
+    """Décrit la base SQLite locale utilisée en secours et pour la migration."""
+
+    backend: str
+
+
+@dataclass(frozen=True)
+class SupabaseConfig:
+    """Décrit la configuration du store documentaire Supabase."""
+
+    url: str
+    key: str
+    schema: str = "public"
+    documents_table: str = SUPABASE_DOCUMENTS_TABLE
+
+
+class DatabaseCursor:
+    """Uniformise les lignes renvoyées par SQLite."""
+
+    def __init__(self, cursor: Any):
+        self._cursor = cursor
+
+    def fetchone(self) -> dict[str, Any] | None:
+        row = self._cursor.fetchone()
+        return normalize_db_row(row)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return [normalize_db_row(row) for row in self._cursor.fetchall()]
+
+    def close(self) -> None:
+        self._cursor.close()
+
+
+class DatabaseConnection:
+    """Expose une API commune minimale pour SQLite."""
+
+    def __init__(self, connection: Any, config: DatabaseConfig):
+        self._connection = connection
+        self.backend = config.backend
+
+    def execute(self, query: str, params: Any = None) -> DatabaseCursor:
+        cursor = self._connection.cursor()
+        cursor.execute(query, () if params is None else params)
+        return DatabaseCursor(cursor)
+
+    def executemany(self, query: str, seq_of_params: list[tuple[Any, ...]]) -> DatabaseCursor:
+        cursor = self._connection.cursor()
+        cursor.executemany(query, seq_of_params)
+        return DatabaseCursor(cursor)
+
+    def commit(self) -> None:
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        self._connection.rollback()
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def normalize_db_scalar(value: Any) -> Any:
+    """Convertit certains types DB vers des valeurs homogènes côté application."""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return value
+
+
+def normalize_db_row(row: Any) -> dict[str, Any] | None:
+    """Convertit une ligne SQL vers un dictionnaire standardisé."""
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        payload = dict(row)
+    elif isinstance(row, dict):
+        payload = dict(row)
+    else:
+        payload = dict(row)
+    return {key: normalize_db_scalar(value) for key, value in payload.items()}
+
+
 def ensure_storage() -> None:
     """Crée le dossier de stockage local si besoin."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-def get_db_connection() -> sqlite3.Connection:
-    """Retourne une connexion SQLite locale."""
-    ensure_storage()
-    connection = sqlite3.connect(DB_PATH)
+def read_secret_section(section_name: str) -> dict[str, Any]:
+    """Lit une section de secrets Streamlit sans échouer si elle est absente."""
+    try:
+        section = st.secrets.get(section_name, {})
+    except StreamlitSecretNotFoundError:
+        return {}
+
+    if not section:
+        return {}
+    if isinstance(section, dict):
+        return dict(section)
+
+    try:
+        return {key: section[key] for key in section}
+    except TypeError:
+        return {}
+
+
+def get_database_config() -> DatabaseConfig:
+    """Retourne la configuration SQLite locale."""
+    return DatabaseConfig(backend=DB_BACKEND_SQLITE)
+
+
+def get_supabase_config() -> SupabaseConfig | None:
+    """Retourne la configuration Supabase si elle est disponible."""
+    supabase_secrets = read_secret_section(SUPABASE_SECRET_SECTION)
+    if not supabase_secrets:
+        return None
+
+    url = clean_value(supabase_secrets.get("url") or supabase_secrets.get("project_url"))
+    key = clean_value(
+        supabase_secrets.get("key")
+        or supabase_secrets.get("service_role_key")
+        or supabase_secrets.get("service_key")
+        or supabase_secrets.get("secret_key")
+    )
+    missing = [
+        label
+        for label, value in {
+            "url": url,
+            "key": key,
+        }.items()
+        if not value
+    ]
+    if missing:
+        missing_values = ", ".join(missing)
+        raise RuntimeError(
+            "Configuration Supabase incomplète dans `.streamlit/secrets.toml`: "
+            f"{missing_values} manquant(s) dans la section `[supabase]`."
+        )
+
+    return SupabaseConfig(
+        url=url,
+        key=key,
+        schema=clean_value(supabase_secrets.get("schema")) or "public",
+        documents_table=clean_value(supabase_secrets.get("documents_table")) or SUPABASE_DOCUMENTS_TABLE,
+    )
+
+
+def use_supabase_storage() -> bool:
+    """Indique si l'application doit utiliser Supabase."""
+    return get_supabase_config() is not None
+
+
+def get_database_label() -> str:
+    """Retourne un libellé simple du backend actif."""
+    return "Supabase" if use_supabase_storage() else "SQLite locale"
+
+
+def get_sqlite_source_connection(db_path: Path) -> sqlite3.Connection:
+    """Ouvre une connexion SQLite brute pour les migrations locales."""
+    connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     return connection
 
 
-def ensure_table_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
-    """Ajoute une colonne SQLite si elle n'existe pas encore."""
+def get_db_connection() -> DatabaseConnection:
+    """Retourne une connexion SQLite locale."""
+    config = get_database_config()
+    ensure_storage()
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return DatabaseConnection(connection, config)
+
+
+def sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    """Indique si une table SQLite source existe."""
+    row = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def sqlite_table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    """Retourne les colonnes d'une table SQLite source."""
+    return {
+        row["name"]
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+
+def ensure_table_column(
+    connection: DatabaseConnection,
+    table_name: str,
+    column_name: str,
+    sqlite_definition: str,
+) -> None:
+    """Ajoute une colonne si elle n'existe pas encore."""
     existing_columns = {
         row["name"]
         for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
     }
-    if column_name not in existing_columns:
-        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+    if column_name in existing_columns:
+        return
+    connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sqlite_definition}")
+
+
+def index_exists(connection: DatabaseConnection, table_name: str, index_name: str) -> bool:
+    """Indique si un index existe déjà."""
+    rows = connection.execute(f"PRAGMA index_list({table_name})").fetchall()
+    return any(row["name"] == index_name for row in rows)
+
+
+def ensure_index(connection: DatabaseConnection, table_name: str, index_name: str, columns: str) -> None:
+    """Crée un index si besoin."""
+    if index_exists(connection, table_name, index_name):
+        return
+    connection.execute(f"CREATE INDEX {index_name} ON {table_name} ({columns})")
+
+
+def get_app_metadata(connection: DatabaseConnection, meta_key: str) -> str:
+    """Lit une métadonnée applicative persistée en base."""
+    row = connection.execute(
+        "SELECT meta_value FROM app_metadata WHERE meta_key = ?",
+        (meta_key,),
+    ).fetchone()
+    return clean_value(row["meta_value"]) if row else ""
+
+
+def set_app_metadata(connection: DatabaseConnection, meta_key: str, meta_value: str) -> None:
+    """Enregistre une métadonnée applicative en base."""
+    query = """
+        INSERT INTO app_metadata (
+            meta_key,
+            meta_value,
+            updated_at
+        )
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(meta_key) DO UPDATE SET
+            meta_value = excluded.meta_value,
+            updated_at = CURRENT_TIMESTAMP
+    """
+    connection.execute(query, (meta_key, meta_value))
+
+
+def initialize_sqlite_schema(connection: DatabaseConnection) -> None:
+    """Initialise le schéma SQLite local."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reference_sources (
+            source_name TEXT PRIMARY KEY,
+            reference_name TEXT,
+            reference_bytes BLOB,
+            reference_separator TEXT,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_sessions (
+            event_name TEXT PRIMARY KEY,
+            reference_source_name TEXT,
+            reference_name TEXT,
+            reference_bytes BLOB,
+            reference_separator TEXT,
+            whatsapp_name TEXT,
+            whatsapp_bytes BLOB,
+            whatsapp_separator TEXT,
+            settings_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS members (
+            member_key TEXT PRIMARY KEY,
+            phone_normalized TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            full_name TEXT,
+            phone_original TEXT,
+            age_text TEXT NOT NULL DEFAULT '',
+            sex TEXT NOT NULL DEFAULT '',
+            function_name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS event_member_overrides (
+            event_name TEXT NOT NULL,
+            member_key TEXT NOT NULL,
+            invite INTEGER NOT NULL DEFAULT 0,
+            manual_category TEXT NOT NULL DEFAULT '',
+            follow_up_note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (event_name, member_key)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            meta_key TEXT PRIMARY KEY,
+            meta_value TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    ensure_table_column(connection, "members", "age_text", "TEXT NOT NULL DEFAULT ''")
+    ensure_table_column(connection, "members", "sex", "TEXT NOT NULL DEFAULT ''")
+    ensure_table_column(connection, "members", "function_name", "TEXT NOT NULL DEFAULT ''")
+    ensure_index(connection, "members", "idx_members_phone_normalized", "phone_normalized")
+    ensure_index(connection, "event_member_overrides", "idx_event_member_overrides_event", "event_name")
+
+    legacy_rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'saved_state'"
+    ).fetchall()
+    has_events = connection.execute("SELECT COUNT(*) AS count FROM event_sessions").fetchone()["count"]
+    if legacy_rows and not has_events:
+        legacy = connection.execute("SELECT * FROM saved_state ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if legacy:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO event_sessions (
+                    event_name,
+                    reference_name,
+                    reference_bytes,
+                    reference_separator,
+                    whatsapp_name,
+                    whatsapp_bytes,
+                    whatsapp_separator,
+                    settings_json,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "Session migrée",
+                    legacy["reference_name"],
+                    legacy["reference_bytes"],
+                    legacy["reference_separator"],
+                    legacy["whatsapp_name"],
+                    legacy["whatsapp_bytes"],
+                    legacy["whatsapp_separator"],
+                    legacy["settings_json"],
+                    legacy["updated_at"],
+                ),
+            )
+
+
+def fetch_sqlite_rows(connection: sqlite3.Connection, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    """Exécute une lecture sur la source SQLite et renvoie des dictionnaires."""
+    return [dict(row) for row in connection.execute(query, params).fetchall()]
+
+
+def build_legacy_override_rows(connection: sqlite3.Connection, fallback_event_name: str) -> list[dict[str, Any]]:
+    """Reconstruit les anciens overrides stockés dans `members` si besoin."""
+    member_columns = sqlite_table_columns(connection, "members")
+    legacy_columns = {"invite", "manual_category", "follow_up_note"}
+    if not legacy_columns.issubset(member_columns):
+        return []
+
+    rows = fetch_sqlite_rows(
+        connection,
+        """
+        SELECT
+            member_key,
+            invite,
+            manual_category,
+            follow_up_note,
+            updated_at
+        FROM members
+        WHERE invite <> 0 OR TRIM(manual_category) <> '' OR TRIM(follow_up_note) <> ''
+        """,
+    )
+    for row in rows:
+        row["event_name"] = fallback_event_name
+    return rows
+
+
+def encode_bytes_for_document(value: bytes | bytearray | None) -> str:
+    """Encode un contenu binaire pour stockage JSON dans Supabase."""
+    if not value:
+        return ""
+    raw = bytes(value)
+    return base64.b64encode(raw).decode("ascii")
+
+
+def decode_bytes_from_document(value: Any) -> bytes | None:
+    """Décode un contenu binaire stocké en base64 dans Supabase."""
+    text = clean_value(value)
+    if not text:
+        return None
+    return base64.b64decode(text.encode("ascii"))
+
+
+def current_timestamp_text() -> str:
+    """Retourne un timestamp UTC stable pour les documents Supabase."""
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def normalize_settings_payload(value: Any) -> dict[str, Any]:
+    """Normalise une configuration stockée dans un document Supabase."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def build_document_key_for_override(event_name: str, member_key: str) -> str:
+    """Construit la clé d'un override événement/membre dans Supabase."""
+    return f"{clean_value(event_name)}|{clean_value(member_key)}"
+
+
+def build_supabase_document(
+    document_type: str,
+    document_key: str,
+    payload: dict[str, Any],
+    updated_at: str | None = None,
+) -> dict[str, Any]:
+    """Construit une ligne du store documentaire Supabase."""
+    return {
+        "document_type": document_type,
+        "document_key": clean_value(document_key),
+        "payload": payload,
+        "updated_at": clean_value(updated_at) or current_timestamp_text(),
+    }
+
+
+def chunk_list(items: list[dict[str, Any]], chunk_size: int = 200) -> list[list[dict[str, Any]]]:
+    """Découpe une liste en paquets pour les upserts Supabase."""
+    return [items[index : index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+_SUPABASE_CLIENT_CACHE: dict[tuple[str, str, str, str], Any] = {}
+
+
+class SupabaseDocumentStore:
+    """Store documentaire minimal au-dessus de la Data API Supabase."""
+
+    def __init__(self, client: Any, config: SupabaseConfig):
+        self.client = client
+        self.config = config
+
+    def _table(self) -> Any:
+        return self.client.table(self.config.documents_table)
+
+    def ensure_documents_table_accessible(self) -> None:
+        try:
+            self._table().select("document_type").limit(1).execute()
+        except Exception as exc:
+            raise RuntimeError(
+                f"La table Supabase `{self.config.documents_table}` est introuvable ou inaccessible. "
+                f"Exécutez le SQL de `{SUPABASE_SCHEMA_PATH.name}` dans le SQL Editor Supabase puis relancez l'application. "
+                f"Détail: {exc}"
+            ) from exc
+
+    def fetch_documents(
+        self,
+        document_type: str,
+        document_key: str | None = None,
+        key_prefix: str | None = None,
+        descending: bool = False,
+    ) -> list[dict[str, Any]]:
+        query = self._table().select("*").eq("document_type", document_type)
+        if document_key is not None:
+            query = query.eq("document_key", clean_value(document_key))
+        if key_prefix is not None:
+            query = query.like("document_key", f"{clean_value(key_prefix)}%")
+        response = query.order("updated_at", desc=descending).execute()
+        return list(response.data or [])
+
+    def fetch_document(self, document_type: str, document_key: str) -> dict[str, Any] | None:
+        documents = self.fetch_documents(document_type, document_key=document_key)
+        return documents[0] if documents else None
+
+    def upsert_documents(self, documents: list[dict[str, Any]]) -> None:
+        if not documents:
+            return
+        for chunk in chunk_list(documents):
+            self._table().upsert(
+                chunk,
+                on_conflict="document_type,document_key",
+                returning="minimal",
+            ).execute()
+
+    def delete_documents(
+        self,
+        document_type: str,
+        document_key: str | None = None,
+        key_prefix: str | None = None,
+    ) -> None:
+        query = self._table().delete().eq("document_type", document_type)
+        if document_key is not None:
+            query = query.eq("document_key", clean_value(document_key))
+        if key_prefix is not None:
+            query = query.like("document_key", f"{clean_value(key_prefix)}%")
+        query.execute()
+
+
+def get_supabase_store() -> SupabaseDocumentStore:
+    """Retourne un client Supabase prêt à l'emploi."""
+    config = get_supabase_config()
+    if config is None:
+        raise RuntimeError("Supabase n'est pas configuré.")
+
+    cache_key = (config.url, config.key, config.schema, config.documents_table)
+    client = _SUPABASE_CLIENT_CACHE.get(cache_key)
+    if client is None:
+        try:
+            from supabase import create_client
+            from supabase.lib.client_options import SyncClientOptions
+        except ImportError as exc:
+            raise RuntimeError(
+                "Supabase est configuré, mais la dépendance `supabase` est absente. "
+                "Installez les dépendances de `requirements.txt`."
+            ) from exc
+
+        client = create_client(
+            config.url,
+            config.key,
+            options=SyncClientOptions(
+                schema=config.schema,
+                postgrest_client_timeout=10,
+                storage_client_timeout=10,
+                auto_refresh_token=False,
+                persist_session=False,
+            ),
+        )
+        _SUPABASE_CLIENT_CACHE[cache_key] = client
+
+    return SupabaseDocumentStore(client, config)
+
+
+def migrate_sqlite_to_supabase_documents() -> None:
+    """Transfère une fois les données SQLite locales vers Supabase."""
+    if not use_supabase_storage() or not DB_PATH.exists():
+        return
+
+    store = get_supabase_store()
+    metadata_document = store.fetch_document(SUPABASE_DOC_TYPE_METADATA, SQLITE_MIGRATION_METADATA_KEY)
+    if metadata_document is not None:
+        return
+
+    with closing(get_sqlite_source_connection(DB_PATH)) as source_connection:
+        reference_rows = (
+            fetch_sqlite_rows(
+                source_connection,
+                """
+                SELECT
+                    source_name,
+                    reference_name,
+                    reference_bytes,
+                    reference_separator,
+                    settings_json,
+                    updated_at
+                FROM reference_sources
+                """,
+            )
+            if sqlite_table_exists(source_connection, "reference_sources")
+            else []
+        )
+
+        event_rows = (
+            fetch_sqlite_rows(
+                source_connection,
+                """
+                SELECT
+                    event_name,
+                    reference_source_name,
+                    reference_name,
+                    reference_bytes,
+                    reference_separator,
+                    whatsapp_name,
+                    whatsapp_bytes,
+                    whatsapp_separator,
+                    settings_json,
+                    updated_at
+                FROM event_sessions
+                """,
+            )
+            if sqlite_table_exists(source_connection, "event_sessions")
+            else []
+        )
+        if not event_rows and sqlite_table_exists(source_connection, "saved_state"):
+            legacy = source_connection.execute("SELECT * FROM saved_state ORDER BY updated_at DESC LIMIT 1").fetchone()
+            if legacy:
+                event_rows = [
+                    {
+                        "event_name": "Session migrée",
+                        "reference_source_name": "",
+                        "reference_name": legacy["reference_name"],
+                        "reference_bytes": legacy["reference_bytes"],
+                        "reference_separator": legacy["reference_separator"],
+                        "whatsapp_name": legacy["whatsapp_name"],
+                        "whatsapp_bytes": legacy["whatsapp_bytes"],
+                        "whatsapp_separator": legacy["whatsapp_separator"],
+                        "settings_json": legacy["settings_json"],
+                        "updated_at": legacy["updated_at"],
+                    }
+                ]
+
+        member_rows = []
+        if sqlite_table_exists(source_connection, "members"):
+            member_columns = sqlite_table_columns(source_connection, "members")
+            select_parts = [
+                "member_key",
+                "phone_normalized",
+                "first_name",
+                "last_name",
+                "full_name",
+                "phone_original",
+                "age_text" if "age_text" in member_columns else "'' AS age_text",
+                "sex" if "sex" in member_columns else "'' AS sex",
+                "function_name" if "function_name" in member_columns else "'' AS function_name",
+                "updated_at",
+            ]
+            member_rows = fetch_sqlite_rows(
+                source_connection,
+                f"SELECT {', '.join(select_parts)} FROM members",
+            )
+
+        override_rows = (
+            fetch_sqlite_rows(
+                source_connection,
+                """
+                SELECT
+                    event_name,
+                    member_key,
+                    invite,
+                    manual_category,
+                    follow_up_note,
+                    updated_at
+                FROM event_member_overrides
+                """,
+            )
+            if sqlite_table_exists(source_connection, "event_member_overrides")
+            else []
+        )
+        if not override_rows and sqlite_table_exists(source_connection, "members"):
+            fallback_event_name = event_rows[0]["event_name"] if event_rows else DEFAULT_LOCAL_SESSION_NAME
+            override_rows = build_legacy_override_rows(source_connection, fallback_event_name)
+
+    documents: list[dict[str, Any]] = []
+    for row in reference_rows:
+        documents.append(
+            build_supabase_document(
+                SUPABASE_DOC_TYPE_REFERENCE_SOURCE,
+                row["source_name"],
+                {
+                    "reference_name": row["reference_name"],
+                    "reference_bytes_b64": encode_bytes_for_document(row["reference_bytes"]),
+                    "reference_separator": row["reference_separator"] or "Auto",
+                    "settings": normalize_settings_payload(row["settings_json"] or "{}"),
+                },
+                updated_at=row["updated_at"],
+            )
+        )
+
+    for row in event_rows:
+        documents.append(
+            build_supabase_document(
+                SUPABASE_DOC_TYPE_EVENT_SESSION,
+                row["event_name"],
+                {
+                    "reference_source_name": clean_value(row.get("reference_source_name")),
+                    "reference_name": row.get("reference_name"),
+                    "reference_bytes_b64": encode_bytes_for_document(row.get("reference_bytes")),
+                    "reference_separator": row.get("reference_separator") or "Auto",
+                    "whatsapp_name": row.get("whatsapp_name"),
+                    "whatsapp_bytes_b64": encode_bytes_for_document(row.get("whatsapp_bytes")),
+                    "whatsapp_separator": row.get("whatsapp_separator") or "Auto",
+                    "settings": normalize_settings_payload(row.get("settings_json") or "{}"),
+                },
+                updated_at=row.get("updated_at"),
+            )
+        )
+
+    for row in member_rows:
+        documents.append(
+            build_supabase_document(
+                SUPABASE_DOC_TYPE_MEMBER,
+                row["member_key"],
+                {
+                    "phone_normalized": row["phone_normalized"],
+                    "first_name": row["first_name"],
+                    "last_name": row["last_name"],
+                    "full_name": row["full_name"],
+                    "phone_original": row["phone_original"],
+                    "age_text": row["age_text"],
+                    "sex": row["sex"],
+                    "function_name": row["function_name"],
+                },
+                updated_at=row["updated_at"],
+            )
+        )
+
+    for row in override_rows:
+        documents.append(
+            build_supabase_document(
+                SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+                build_document_key_for_override(row["event_name"], row["member_key"]),
+                {
+                    "event_name": row["event_name"],
+                    "member_key": row["member_key"],
+                    "invite": int(row["invite"] or 0),
+                    "manual_category": row["manual_category"] or "",
+                    "follow_up_note": row["follow_up_note"] or "",
+                },
+                updated_at=row["updated_at"],
+            )
+        )
+
+    store.upsert_documents(documents)
+    migration_timestamp = current_timestamp_text()
+    store.upsert_documents(
+        [
+            build_supabase_document(
+                SUPABASE_DOC_TYPE_METADATA,
+                SQLITE_MIGRATION_METADATA_KEY,
+                {"value": migration_timestamp},
+                updated_at=migration_timestamp,
+            )
+        ]
+    )
 
 
 def initialize_database() -> None:
-    """Initialise la base locale de l'application."""
+    """Initialise le backend de stockage de l'application."""
+    if use_supabase_storage():
+        store = get_supabase_store()
+        store.ensure_documents_table_accessible()
+        migrate_sqlite_to_supabase_documents()
+        return
+
     with closing(get_db_connection()) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reference_sources (
-                source_name TEXT PRIMARY KEY,
-                reference_name TEXT,
-                reference_bytes BLOB,
-                reference_separator TEXT,
-                settings_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS event_sessions (
-                event_name TEXT PRIMARY KEY,
-                reference_source_name TEXT,
-                reference_name TEXT,
-                reference_bytes BLOB,
-                reference_separator TEXT,
-                whatsapp_name TEXT,
-                whatsapp_bytes BLOB,
-                whatsapp_separator TEXT,
-                settings_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS members (
-                member_key TEXT PRIMARY KEY,
-                phone_normalized TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                full_name TEXT,
-                phone_original TEXT,
-                age_text TEXT NOT NULL DEFAULT '',
-                sex TEXT NOT NULL DEFAULT '',
-                function_name TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS event_member_overrides (
-                event_name TEXT NOT NULL,
-                member_key TEXT NOT NULL,
-                invite INTEGER NOT NULL DEFAULT 0,
-                manual_category TEXT NOT NULL DEFAULT '',
-                follow_up_note TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (event_name, member_key)
-            )
-            """
-        )
-
-        ensure_table_column(connection, "members", "age_text", "TEXT NOT NULL DEFAULT ''")
-        ensure_table_column(connection, "members", "sex", "TEXT NOT NULL DEFAULT ''")
-        ensure_table_column(connection, "members", "function_name", "TEXT NOT NULL DEFAULT ''")
-
-        connection.execute("CREATE INDEX IF NOT EXISTS idx_members_phone_normalized ON members(phone_normalized)")
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_event_member_overrides_event ON event_member_overrides(event_name)"
-        )
-
-        legacy_rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'saved_state'").fetchall()
-        has_events = connection.execute("SELECT COUNT(*) AS count FROM event_sessions").fetchone()["count"]
-        if legacy_rows and not has_events:
-            legacy = connection.execute("SELECT * FROM saved_state ORDER BY updated_at DESC LIMIT 1").fetchone()
-            if legacy:
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO event_sessions (
-                        event_name,
-                        reference_name,
-                        reference_bytes,
-                        reference_separator,
-                        whatsapp_name,
-                        whatsapp_bytes,
-                        whatsapp_separator,
-                        settings_json,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        "Session migrée",
-                        legacy["reference_name"],
-                        legacy["reference_bytes"],
-                        legacy["reference_separator"],
-                        legacy["whatsapp_name"],
-                        legacy["whatsapp_bytes"],
-                        legacy["whatsapp_separator"],
-                        legacy["settings_json"],
-                        legacy["updated_at"],
-                    ),
-                )
+        initialize_sqlite_schema(connection)
         connection.commit()
+
+
+def get_supabase_document_payload(document: dict[str, Any] | None) -> dict[str, Any]:
+    """Retourne le payload JSON d'un document Supabase sous forme de dictionnaire."""
+    if not isinstance(document, dict):
+        return {}
+    payload = document.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def build_event_snapshot_from_supabase_document(document: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Convertit un document Supabase en instantané d'événement."""
+    if not document:
+        return None
+
+    payload = get_supabase_document_payload(document)
+    return {
+        "event_name": clean_value(document.get("document_key")),
+        "reference_source_name": clean_value(payload.get("reference_source_name")),
+        "reference_name": payload.get("reference_name"),
+        "reference_bytes": decode_bytes_from_document(payload.get("reference_bytes_b64")),
+        "reference_separator": clean_value(payload.get("reference_separator")) or "Auto",
+        "whatsapp_name": payload.get("whatsapp_name"),
+        "whatsapp_bytes": decode_bytes_from_document(payload.get("whatsapp_bytes_b64")),
+        "whatsapp_separator": clean_value(payload.get("whatsapp_separator")) or "Auto",
+        "settings": normalize_settings_payload(payload.get("settings")),
+        "updated_at": clean_value(document.get("updated_at")),
+    }
+
+
+def build_reference_source_from_supabase_document(document: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Convertit un document Supabase en source membres."""
+    if not document:
+        return None
+
+    payload = get_supabase_document_payload(document)
+    return {
+        "source_name": clean_value(document.get("document_key")),
+        "reference_name": payload.get("reference_name"),
+        "reference_bytes": decode_bytes_from_document(payload.get("reference_bytes_b64")),
+        "reference_separator": clean_value(payload.get("reference_separator")) or "Auto",
+        "settings": normalize_settings_payload(payload.get("settings")),
+        "updated_at": clean_value(document.get("updated_at")),
+    }
 
 
 def list_saved_events() -> list[dict[str, str]]:
     """Retourne la liste des événements enregistrés."""
+    if use_supabase_storage():
+        store = get_supabase_store()
+        rows = [
+            {
+                "event_name": clean_value(document.get("document_key")),
+                "reference_source_name": clean_value(get_supabase_document_payload(document).get("reference_source_name")),
+                "updated_at": clean_value(document.get("updated_at")),
+            }
+            for document in store.fetch_documents(SUPABASE_DOC_TYPE_EVENT_SESSION, descending=True)
+        ]
+        rows.sort(key=lambda row: normalize_label(row["event_name"]))
+        rows.sort(key=lambda row: clean_value(row["updated_at"]), reverse=True)
+        return rows
+
     with closing(get_db_connection()) as connection:
         rows = connection.execute(
             """
@@ -425,6 +1119,19 @@ def list_saved_events() -> list[dict[str, str]]:
 
 def list_reference_sources() -> list[dict[str, str]]:
     """Retourne la liste des sources membres enregistrées."""
+    if use_supabase_storage():
+        store = get_supabase_store()
+        rows = [
+            {
+                "source_name": clean_value(document.get("document_key")),
+                "reference_name": clean_value(get_supabase_document_payload(document).get("reference_name")),
+                "updated_at": clean_value(document.get("updated_at")),
+            }
+            for document in store.fetch_documents(SUPABASE_DOC_TYPE_REFERENCE_SOURCE)
+        ]
+        rows.sort(key=lambda row: normalize_label(row["source_name"]))
+        return rows
+
     with closing(get_db_connection()) as connection:
         rows = connection.execute(
             """
@@ -440,6 +1147,11 @@ def load_event_snapshot(event_name: str | None) -> dict[str, Any] | None:
     """Charge un événement sauvegardé."""
     if not clean_value(event_name):
         return None
+
+    if use_supabase_storage():
+        store = get_supabase_store()
+        document = store.fetch_document(SUPABASE_DOC_TYPE_EVENT_SESSION, clean_value(event_name))
+        return build_event_snapshot_from_supabase_document(document)
 
     with closing(get_db_connection()) as connection:
         row = connection.execute(
@@ -472,6 +1184,11 @@ def load_event_snapshot(event_name: str | None) -> dict[str, Any] | None:
 
 def load_saved_snapshot() -> dict[str, Any] | None:
     """Charge la session locale la plus récente."""
+    if use_supabase_storage():
+        store = get_supabase_store()
+        documents = store.fetch_documents(SUPABASE_DOC_TYPE_EVENT_SESSION, descending=True)
+        return build_event_snapshot_from_supabase_document(documents[0] if documents else None)
+
     with closing(get_db_connection()) as connection:
         row = connection.execute(
             """
@@ -492,6 +1209,11 @@ def load_reference_source(source_name: str | None) -> dict[str, Any] | None:
     """Charge une source membres enregistrée."""
     if not clean_value(source_name):
         return None
+
+    if use_supabase_storage():
+        store = get_supabase_store()
+        document = store.fetch_document(SUPABASE_DOC_TYPE_REFERENCE_SOURCE, clean_value(source_name))
+        return build_reference_source_from_supabase_document(document)
 
     with closing(get_db_connection()) as connection:
         row = connection.execute(
@@ -525,9 +1247,26 @@ def save_reference_source(source_name: str, reference_source: dict[str, Any], se
         raise ValueError("Le nom de la source membres est obligatoire.")
 
     settings_payload = settings or {}
+    if use_supabase_storage():
+        store = get_supabase_store()
+        store.upsert_documents(
+            [
+                build_supabase_document(
+                    SUPABASE_DOC_TYPE_REFERENCE_SOURCE,
+                    normalized_name,
+                    {
+                        "reference_name": reference_source.get("name"),
+                        "reference_bytes_b64": encode_bytes_for_document(reference_source.get("bytes")),
+                        "reference_separator": clean_value(reference_source.get("separator")) or "Auto",
+                        "settings": settings_payload,
+                    },
+                )
+            ]
+        )
+        return
+
     with closing(get_db_connection()) as connection:
-        connection.execute(
-            """
+        query = """
             INSERT INTO reference_sources (
                 source_name,
                 reference_name,
@@ -543,7 +1282,9 @@ def save_reference_source(source_name: str, reference_source: dict[str, Any], se
                 reference_separator = excluded.reference_separator,
                 settings_json = excluded.settings_json,
                 updated_at = CURRENT_TIMESTAMP
-            """,
+        """
+        connection.execute(
+            query,
             (
                 normalized_name,
                 reference_source.get("name"),
@@ -567,9 +1308,30 @@ def save_event_session(
     if not normalized_event_name:
         raise ValueError("Le nom de l'événement est obligatoire.")
 
+    if use_supabase_storage():
+        store = get_supabase_store()
+        store.upsert_documents(
+            [
+                build_supabase_document(
+                    SUPABASE_DOC_TYPE_EVENT_SESSION,
+                    normalized_event_name,
+                    {
+                        "reference_source_name": clean_value(reference_source_name),
+                        "reference_name": reference_source.get("name"),
+                        "reference_bytes_b64": encode_bytes_for_document(reference_source.get("bytes")),
+                        "reference_separator": clean_value(reference_source.get("separator")) or "Auto",
+                        "whatsapp_name": whatsapp_source.get("name"),
+                        "whatsapp_bytes_b64": encode_bytes_for_document(whatsapp_source.get("bytes")),
+                        "whatsapp_separator": clean_value(whatsapp_source.get("separator")) or "Auto",
+                        "settings": settings,
+                    },
+                )
+            ]
+        )
+        return
+
     with closing(get_db_connection()) as connection:
-        connection.execute(
-            """
+        query = """
             INSERT INTO event_sessions (
                 event_name,
                 reference_source_name,
@@ -593,7 +1355,9 @@ def save_event_session(
                 whatsapp_separator = excluded.whatsapp_separator,
                 settings_json = excluded.settings_json,
                 updated_at = CURRENT_TIMESTAMP
-            """,
+        """
+        connection.execute(
+            query,
             (
                 normalized_event_name,
                 clean_value(reference_source_name),
@@ -623,9 +1387,22 @@ def save_session_snapshot(
 
 def delete_event_session(event_name: str) -> None:
     """Supprime un événement sauvegardé."""
+    normalized_event_name = clean_value(event_name)
+    if not normalized_event_name:
+        return
+
+    if use_supabase_storage():
+        store = get_supabase_store()
+        store.delete_documents(SUPABASE_DOC_TYPE_EVENT_SESSION, document_key=normalized_event_name)
+        store.delete_documents(
+            SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+            key_prefix=f"{normalized_event_name}|",
+        )
+        return
+
     with closing(get_db_connection()) as connection:
-        connection.execute("DELETE FROM event_sessions WHERE event_name = ?", (clean_value(event_name),))
-        connection.execute("DELETE FROM event_member_overrides WHERE event_name = ?", (clean_value(event_name),))
+        connection.execute("DELETE FROM event_sessions WHERE event_name = ?", (normalized_event_name,))
+        connection.execute("DELETE FROM event_member_overrides WHERE event_name = ?", (normalized_event_name,))
         connection.commit()
 
 
@@ -639,6 +1416,53 @@ def rename_event_session(current_event_name: str, new_event_name: str) -> str:
         raise ValueError("Le nouveau nom de l'événement est obligatoire.")
     if normalized_current_name == normalized_new_name:
         raise ValueError("Saisissez un nouveau nom différent de l'actuel.")
+
+    if use_supabase_storage():
+        store = get_supabase_store()
+        current_document = store.fetch_document(SUPABASE_DOC_TYPE_EVENT_SESSION, normalized_current_name)
+        if current_document is None:
+            raise ValueError("L'événement à renommer est introuvable.")
+
+        target_document = store.fetch_document(SUPABASE_DOC_TYPE_EVENT_SESSION, normalized_new_name)
+        if target_document is not None:
+            raise ValueError("Un événement porte déjà ce nom.")
+
+        new_documents = [
+            build_supabase_document(
+                SUPABASE_DOC_TYPE_EVENT_SESSION,
+                normalized_new_name,
+                get_supabase_document_payload(current_document),
+            )
+        ]
+
+        override_documents = store.fetch_documents(
+            SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+            key_prefix=f"{normalized_current_name}|",
+        )
+        for document in override_documents:
+            payload = get_supabase_document_payload(document)
+            member_key = clean_value(payload.get("member_key"))
+            new_documents.append(
+                build_supabase_document(
+                    SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+                    build_document_key_for_override(normalized_new_name, member_key),
+                    {
+                        "event_name": normalized_new_name,
+                        "member_key": member_key,
+                        "invite": int(payload.get("invite") or 0),
+                        "manual_category": clean_value(payload.get("manual_category")),
+                        "follow_up_note": clean_value(payload.get("follow_up_note")),
+                    },
+                )
+            )
+
+        store.upsert_documents(new_documents)
+        store.delete_documents(SUPABASE_DOC_TYPE_EVENT_SESSION, document_key=normalized_current_name)
+        store.delete_documents(
+            SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+            key_prefix=f"{normalized_current_name}|",
+        )
+        return normalized_new_name
 
     with closing(get_db_connection()) as connection:
         current_row = connection.execute(
@@ -714,6 +1538,13 @@ def build_member_base_editor_frame(reference_data: pd.DataFrame) -> pd.DataFrame
 
 def get_member_registry_summary() -> dict[str, Any]:
     """Retourne un résumé simple de la base membres locale."""
+    if use_supabase_storage():
+        documents = get_supabase_store().fetch_documents(SUPABASE_DOC_TYPE_MEMBER, descending=True)
+        return {
+            "count": len(documents),
+            "updated_at": clean_value(documents[0].get("updated_at")) if documents else "",
+        }
+
     with closing(get_db_connection()) as connection:
         row = connection.execute(
             """
@@ -730,9 +1561,52 @@ def get_member_registry_summary() -> dict[str, Any]:
 
 def load_member_base() -> pd.DataFrame:
     """Charge la base membres locale dans un format éditable."""
+    if use_supabase_storage():
+        records = []
+        for document in get_supabase_store().fetch_documents(SUPABASE_DOC_TYPE_MEMBER):
+            payload = get_supabase_document_payload(document)
+            records.append(
+                {
+                    "first_name": clean_value(payload.get("first_name")),
+                    "last_name": clean_value(payload.get("last_name")),
+                    "full_name": clean_value(payload.get("full_name")),
+                    "phone_original": clean_value(payload.get("phone_original")),
+                    "age_text": clean_value(payload.get("age_text")),
+                    "sex": clean_value(payload.get("sex")),
+                    "function_name": clean_value(payload.get("function_name")),
+                    "phone_normalized": clean_value(payload.get("phone_normalized")),
+                }
+            )
+
+        if not records:
+            return get_empty_member_base_frame()
+
+        records.sort(
+            key=lambda row: (
+                normalize_label(row["full_name"]) or normalize_label(f"{row['first_name']} {row['last_name']}"),
+                clean_value(row["phone_normalized"]),
+            )
+        )
+        return pd.DataFrame(records).rename(
+            columns={
+                "first_name": "Prénom",
+                "last_name": "Nom",
+                "full_name": "Nom complet",
+                "phone_original": "Téléphone",
+                "age_text": "Âge",
+                "sex": "Sexe",
+                "function_name": "Fonction",
+            }
+        ).fillna("")
+
     with closing(get_db_connection()) as connection:
+        sort_expression = (
+            "LOWER(TRIM(first_name || ' ' || last_name))"
+            if connection.backend == DB_BACKEND_SQLITE
+            else "LOWER(TRIM(CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, ''))))"
+        )
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 first_name,
                 last_name,
@@ -745,7 +1619,7 @@ def load_member_base() -> pd.DataFrame:
             ORDER BY
                 CASE
                     WHEN TRIM(full_name) <> '' THEN LOWER(TRIM(full_name))
-                    ELSE LOWER(TRIM(first_name || ' ' || last_name))
+                    ELSE {sort_expression}
                 END,
                 phone_normalized
             """
@@ -787,6 +1661,47 @@ def save_member_base(reference_data: pd.DataFrame) -> dict[str, int]:
                 clean_value(row.get("fonction")),
             )
         )
+
+    if use_supabase_storage():
+        store = get_supabase_store()
+        store.delete_documents(SUPABASE_DOC_TYPE_MEMBER)
+        if payload:
+            store.upsert_documents(
+                [
+                    build_supabase_document(
+                        SUPABASE_DOC_TYPE_MEMBER,
+                        member_key,
+                        {
+                            "phone_normalized": phone_normalized,
+                            "first_name": first_name,
+                            "last_name": last_name,
+                            "full_name": full_name,
+                            "phone_original": phone_original,
+                            "age_text": age_text,
+                            "sex": sex,
+                            "function_name": function_name,
+                        },
+                    )
+                    for (
+                        member_key,
+                        phone_normalized,
+                        first_name,
+                        last_name,
+                        full_name,
+                        phone_original,
+                        age_text,
+                        sex,
+                        function_name,
+                    ) in payload
+                ]
+            )
+        return {
+            "count": len(payload),
+            "invalid_count": int((~reference_data["telephone_reference_valide"]).sum()) if not reference_data.empty else 0,
+            "duplicate_count": int(reference_data.loc[reference_data["doublon_reference"] > 1, "member_key"].nunique())
+            if not reference_data.empty
+            else 0,
+        }
 
     with closing(get_db_connection()) as connection:
         connection.execute("DELETE FROM members")
@@ -855,10 +1770,59 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
         return result
 
     rows = result.to_dict("records")
-    with closing(get_db_connection()) as connection:
+    if use_supabase_storage():
+        store = get_supabase_store()
+        existing_members = {
+            clean_value(document.get("document_key")): get_supabase_document_payload(document)
+            for document in store.fetch_documents(SUPABASE_DOC_TYPE_MEMBER)
+        }
+
+        member_documents = []
         for row in rows:
-            connection.execute(
-                """
+            member_key = clean_value(row.get("member_key"))
+            existing_payload = existing_members.get(member_key, {})
+            member_documents.append(
+                build_supabase_document(
+                    SUPABASE_DOC_TYPE_MEMBER,
+                    member_key,
+                    {
+                        "phone_normalized": clean_value(row.get("telephone_reference_normalise")),
+                        "first_name": clean_value(row.get("prenom")),
+                        "last_name": clean_value(row.get("nom")),
+                        "full_name": clean_value(row.get("nom_complet")),
+                        "phone_original": clean_value(row.get("telephone_reference_original")),
+                        "age_text": clean_value(row.get("age")) or clean_value(existing_payload.get("age_text")),
+                        "sex": clean_value(row.get("sexe")) or clean_value(existing_payload.get("sex")),
+                        "function_name": clean_value(row.get("fonction")) or clean_value(existing_payload.get("function_name")),
+                    },
+                )
+            )
+        store.upsert_documents(member_documents)
+
+        stored_rows = [
+            {
+                "member_key": clean_value(document.get("document_key")),
+                "age_text": clean_value(get_supabase_document_payload(document).get("age_text")),
+                "sex": clean_value(get_supabase_document_payload(document).get("sex")),
+                "function_name": clean_value(get_supabase_document_payload(document).get("function_name")),
+            }
+            for document in member_documents
+        ]
+        override_rows = [
+            {
+                "member_key": clean_value(get_supabase_document_payload(document).get("member_key")),
+                "invite": int(get_supabase_document_payload(document).get("invite") or 0),
+                "manual_category": clean_value(get_supabase_document_payload(document).get("manual_category")),
+                "follow_up_note": clean_value(get_supabase_document_payload(document).get("follow_up_note")),
+            }
+            for document in store.fetch_documents(
+                SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+                key_prefix=f"{clean_value(event_name)}|",
+            )
+        ]
+    else:
+        with closing(get_db_connection()) as connection:
+            member_upsert_query = """
                 INSERT INTO members (
                     member_key,
                     phone_normalized,
@@ -882,30 +1846,33 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
                     sex = CASE WHEN excluded.sex <> '' THEN excluded.sex ELSE members.sex END,
                     function_name = CASE WHEN excluded.function_name <> '' THEN excluded.function_name ELSE members.function_name END,
                     updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    row["member_key"],
-                    row["telephone_reference_normalise"],
-                    row["prenom"],
-                    row["nom"],
-                    row["nom_complet"],
-                    row["telephone_reference_original"],
-                    row["age"],
-                    row["sexe"],
-                    row["fonction"],
-                ),
-            )
-        connection.commit()
+            """
+            for row in rows:
+                connection.execute(
+                    member_upsert_query,
+                    (
+                        row["member_key"],
+                        row["telephone_reference_normalise"],
+                        row["prenom"],
+                        row["nom"],
+                        row["nom_complet"],
+                        row["telephone_reference_original"],
+                        row["age"],
+                        row["sexe"],
+                        row["fonction"],
+                    ),
+                )
+            connection.commit()
 
-        keys = result["member_key"].dropna().astype(str).tolist()
-        placeholders = ",".join("?" for _ in keys)
-        member_query = f"SELECT member_key, age_text, sex, function_name FROM members WHERE member_key IN ({placeholders})"
-        override_query = (
-            f"SELECT member_key, invite, manual_category, follow_up_note "
-            f"FROM event_member_overrides WHERE event_name = ? AND member_key IN ({placeholders})"
-        )
-        stored_rows = connection.execute(member_query, keys).fetchall() if keys else []
-        override_rows = connection.execute(override_query, [clean_value(event_name), *keys]).fetchall() if keys else []
+            keys = result["member_key"].dropna().astype(str).tolist()
+            placeholders = ",".join("?" for _ in keys)
+            member_query = f"SELECT member_key, age_text, sex, function_name FROM members WHERE member_key IN ({placeholders})"
+            override_query = (
+                f"SELECT member_key, invite, manual_category, follow_up_note "
+                f"FROM event_member_overrides WHERE event_name = ? AND member_key IN ({placeholders})"
+            )
+            stored_rows = connection.execute(member_query, keys).fetchall() if keys else []
+            override_rows = connection.execute(override_query, [clean_value(event_name), *keys]).fetchall() if keys else []
 
     if not stored_rows:
         return result
@@ -975,9 +1942,28 @@ def save_member_updates(event_name: str, updates: pd.DataFrame) -> None:
             )
         )
 
+    if use_supabase_storage():
+        store = get_supabase_store()
+        store.upsert_documents(
+            [
+                build_supabase_document(
+                    SUPABASE_DOC_TYPE_EVENT_MEMBER_OVERRIDE,
+                    build_document_key_for_override(current_event_name, member_key),
+                    {
+                        "event_name": current_event_name,
+                        "member_key": member_key,
+                        "invite": invite,
+                        "manual_category": manual_category,
+                        "follow_up_note": follow_up_note,
+                    },
+                )
+                for current_event_name, invite, manual_category, follow_up_note, member_key in payload
+            ]
+        )
+        return
+
     with closing(get_db_connection()) as connection:
-        connection.executemany(
-            """
+        query = """
             INSERT INTO event_member_overrides (
                 event_name,
                 invite,
@@ -992,7 +1978,9 @@ def save_member_updates(event_name: str, updates: pd.DataFrame) -> None:
                 manual_category = excluded.manual_category,
                 follow_up_note = excluded.follow_up_note,
                 updated_at = CURRENT_TIMESTAMP
-            """,
+        """
+        connection.executemany(
+            query,
             payload,
         )
         connection.commit()
@@ -1918,7 +2906,7 @@ def build_member_base_source(member_base_df: pd.DataFrame) -> dict[str, Any]:
         "name": "base_membres.xlsx",
         "bytes": buffer.getvalue(),
         "separator": "Auto",
-        "origin": "Base membres locale",
+        "origin": "Base membres enregistrée",
     }
 
 
@@ -2233,7 +3221,16 @@ def main() -> None:
     """Point d'entrée de l'application Streamlit."""
     st.set_page_config(page_title="Suivi des sondages WhatsApp", layout="wide")
     require_app_password()
-    initialize_database()
+    try:
+        initialize_database()
+        database_label = get_database_label()
+    except Exception as exc:
+        st.title("Suivi des réponses à des sondages WhatsApp")
+        st.error(
+            "Impossible d'initialiser la base de données configurée. "
+            f"Vérifiez les secrets Streamlit et la configuration Supabase. Détail: {exc}"
+        )
+        st.stop()
 
     saved_events = list_saved_events()
     saved_event_names = [row["event_name"] for row in saved_events]
@@ -2251,8 +3248,8 @@ def main() -> None:
 
     st.title("Suivi des réponses à des sondages WhatsApp")
     st.write(
-        "Conservez une base membres locale, créez plusieurs événements dans SQLite et rechargez chaque vote WhatsApp "
-        "depuis une liste déroulante."
+        "Conservez une base membres partagée, créez plusieurs événements et rechargez chaque vote WhatsApp "
+        f"depuis une liste déroulante. Les données sont sauvegardées dans {database_label}."
     )
 
     with st.sidebar:
@@ -2262,6 +3259,7 @@ def main() -> None:
 
         st.divider()
         st.header("Base membres")
+        st.caption(f"Stockage actif: {database_label}")
         if member_summary["count"]:
             st.caption(
                 f"{member_summary['count']} membre(s) en base"
@@ -2446,9 +3444,9 @@ def main() -> None:
         if reference_file is not None and not uploaded_reference_df.empty:
             show_preview("Liste de membres importée", uploaded_reference_df, uploaded_reference_metadata, "Fichier importé")
         elif not stored_member_base.empty:
-            show_preview("Base membres enregistrée", stored_member_base, {"file_type": "Base locale"}, "Base locale")
+            show_preview("Base membres enregistrée", stored_member_base, {"file_type": "Base enregistrée"}, database_label)
         else:
-            st.info("Importez une liste de membres pour alimenter la base locale.")
+            st.info("Importez une liste de membres pour alimenter la base membres enregistrée.")
     with preview_right:
         if whatsapp_source is None:
             st.info("Importez un CSV WhatsApp ou sélectionnez un événement déjà enregistré.")
@@ -2462,7 +3460,7 @@ def main() -> None:
     st.subheader("2. Base membres")
     if reference_file is None:
         st.info(
-            "La base membres locale sert de référence commune à tous les événements. "
+            "La base membres enregistrée sert de référence commune à tous les événements. "
             "Vous pouvez la modifier directement ci-dessous."
         )
     elif uploaded_reference_df.empty:
@@ -2489,7 +3487,7 @@ def main() -> None:
         prepare_select_default("ref_gender", reference_options, reference_suggestions["gender"] or "-- Aucun --")
         prepare_select_default("ref_function", reference_options, reference_suggestions["function"] or "-- Aucun --")
 
-        st.write("Mappez les colonnes du fichier membres avant de l'intégrer à la base locale.")
+        st.write("Mappez les colonnes du fichier membres avant de l'intégrer à la base membres.")
         map_col_a, map_col_b = st.columns(2)
         with map_col_a:
             first_name_selection = st.selectbox("Colonne prénom", options=reference_options, key="ref_first_name")
@@ -2727,7 +3725,7 @@ def main() -> None:
             if process_button:
                 st.success(f"Événement « {current_event_name} » analysé et sauvegardé.")
             elif auto_process:
-                st.info(f"L'événement « {current_event_name} » a été rechargé automatiquement depuis SQLite.")
+                st.info(f"L'événement « {current_event_name} » a été rechargé automatiquement depuis la base de données.")
 
     if "results" not in st.session_state:
         st.info("Configurez la base membres et le vote WhatsApp puis lancez le traitement pour afficher les résultats.")
@@ -2746,7 +3744,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Exports")
-        st.caption("Le traitement et les modifications manuelles sont sauvegardés dans SQLite.")
+        st.caption(f"Le traitement et les modifications manuelles sont sauvegardés dans {database_label}.")
         st.download_button(
             "Exporter le résultat en Excel",
             data=st.session_state["export_excel"],
@@ -2804,7 +3802,7 @@ def main() -> None:
     st.subheader("7. Suivi manuel et relance")
     st.write(
         "Utilisez ce tableau pour marquer une décision manuelle, cocher les invités et garder une note de suivi. "
-        "Les modifications sont sauvegardées en base locale et réappliquées automatiquement au prochain lancement."
+        "Les modifications sont sauvegardées en base de données et réappliquées automatiquement au prochain lancement."
     )
     follow_up_filter_options = [
         "Tous",
@@ -2891,7 +3889,7 @@ def main() -> None:
             reference_separator,
             whatsapp_separator,
         )
-        st.success("Modifications enregistrées en base locale.")
+        st.success("Modifications enregistrées en base de données.")
         st.rerun()
 
     st.subheader("8. Tableaux détaillés")
