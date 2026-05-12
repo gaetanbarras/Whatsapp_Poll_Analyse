@@ -110,6 +110,7 @@ Dans les colonnes de réponse, un `X` ou `x` indique une option sélectionnée. 
 6. si besoin, configurer quelles options signifient `Présent`, `Absent` ou `Autre`
 7. lancer le traitement
 8. utiliser la section `Suivi manuel et relance` pour :
+   - saisir une réponse brute manuelle
    - marquer une décision manuelle
    - cocher la colonne `Invité`
    - saisir une note de suivi
@@ -142,7 +143,7 @@ Le tableau principal contient notamment :
 - téléphone original et normalisé côté référence
 - nom WhatsApp
 - téléphone original et normalisé côté WhatsApp
-- réponses brutes détectées
+- réponses brutes
 - catégorie automatique
 - catégorie manuelle
 - catégorie finale

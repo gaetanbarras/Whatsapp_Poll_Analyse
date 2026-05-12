@@ -26,7 +26,12 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 ANALYSIS_MODE_FREE = "Analyse libre"
 ANALYSIS_MODE_CATEGORIZED = "Analyse catégorisée"
-MANUAL_CATEGORY_OPTIONS = ["Automatique", "Présent", "Absent", "Autre", "Pas de réponse"]
+MANUAL_DECISION_AUTOMATIC = "Automatique"
+MANUAL_DECISION_FREE_TEXT = "Réponse libre"
+MANUAL_DECISION_OPTION_PREFIX = "Option du sondage : "
+MANUAL_DECISION_FORCE_PREFIX = "Forcer la catégorie : "
+FORCED_MANUAL_CATEGORIES = ["Présent", "Absent", "Autre", "Pas de réponse"]
+RESPONSE_VALUE_SEPARATOR = " | "
 DB_PATH = Path(__file__).resolve().parent / ".app_data" / "whatsapp_poll.db"
 SUPABASE_SCHEMA_PATH = Path(__file__).resolve().parent / "supabase_schema.sql"
 DEFAULT_LOCAL_SESSION_NAME = "Session locale"
@@ -94,7 +99,7 @@ RESULT_COLUMN_LABELS = {
     "nom_whatsapp": "Nom WhatsApp",
     "telephone_whatsapp_original": "Téléphone original WhatsApp",
     "telephone_whatsapp_normalise": "Téléphone normalisé WhatsApp",
-    "reponses_brutes_detectees": "Réponses brutes détectées",
+    "reponses_brutes_detectees": "Réponses brutes",
     "categorie_automatique": "Catégorie automatique",
     "categorie_manuelle": "Catégorie manuelle",
     "categorie_finale": "Catégorie finale",
@@ -593,6 +598,7 @@ def initialize_sqlite_schema(connection: DatabaseConnection) -> None:
             member_key TEXT NOT NULL,
             invite INTEGER NOT NULL DEFAULT 0,
             manual_category TEXT NOT NULL DEFAULT '',
+            manual_raw_response TEXT NOT NULL DEFAULT '',
             follow_up_note TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (event_name, member_key)
@@ -612,6 +618,7 @@ def initialize_sqlite_schema(connection: DatabaseConnection) -> None:
     ensure_table_column(connection, "members", "age_text", "TEXT NOT NULL DEFAULT ''")
     ensure_table_column(connection, "members", "sex", "TEXT NOT NULL DEFAULT ''")
     ensure_table_column(connection, "members", "function_name", "TEXT NOT NULL DEFAULT ''")
+    ensure_table_column(connection, "event_member_overrides", "manual_raw_response", "TEXT NOT NULL DEFAULT ''")
     ensure_index(connection, "members", "idx_members_phone_normalized", "phone_normalized")
     ensure_index(connection, "event_member_overrides", "idx_event_member_overrides_event", "event_name")
 
@@ -678,6 +685,7 @@ def build_legacy_override_rows(connection: sqlite3.Connection, fallback_event_na
     )
     for row in rows:
         row["event_name"] = fallback_event_name
+        row["manual_raw_response"] = ""
     return rows
 
 
@@ -931,16 +939,31 @@ def migrate_sqlite_to_supabase_documents() -> None:
         override_rows = (
             fetch_sqlite_rows(
                 source_connection,
-                """
-                SELECT
-                    event_name,
-                    member_key,
-                    invite,
-                    manual_category,
-                    follow_up_note,
-                    updated_at
-                FROM event_member_overrides
-                """,
+                (
+                    """
+                    SELECT
+                        event_name,
+                        member_key,
+                        invite,
+                        manual_category,
+                        manual_raw_response,
+                        follow_up_note,
+                        updated_at
+                    FROM event_member_overrides
+                    """
+                    if "manual_raw_response" in sqlite_table_columns(source_connection, "event_member_overrides")
+                    else """
+                    SELECT
+                        event_name,
+                        member_key,
+                        invite,
+                        manual_category,
+                        '' AS manual_raw_response,
+                        follow_up_note,
+                        updated_at
+                    FROM event_member_overrides
+                    """
+                ),
             )
             if sqlite_table_exists(source_connection, "event_member_overrides")
             else []
@@ -1013,6 +1036,7 @@ def migrate_sqlite_to_supabase_documents() -> None:
                     "member_key": row["member_key"],
                     "invite": int(row["invite"] or 0),
                     "manual_category": row["manual_category"] or "",
+                    "manual_raw_response": row.get("manual_raw_response") or "",
                     "follow_up_note": row["follow_up_note"] or "",
                 },
                 updated_at=row["updated_at"],
@@ -1451,6 +1475,7 @@ def rename_event_session(current_event_name: str, new_event_name: str) -> str:
                         "member_key": member_key,
                         "invite": int(payload.get("invite") or 0),
                         "manual_category": clean_value(payload.get("manual_category")),
+                        "manual_raw_response": clean_value(payload.get("manual_raw_response")),
                         "follow_up_note": clean_value(payload.get("follow_up_note")),
                     },
                 )
@@ -1764,6 +1789,7 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
     result = reference_data.copy()
     result["invite"] = False
     result["categorie_manuelle"] = ""
+    result["reponse_brute_manuelle"] = ""
     result["commentaire_suivi"] = ""
 
     if result.empty:
@@ -1813,6 +1839,7 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
                 "member_key": clean_value(get_supabase_document_payload(document).get("member_key")),
                 "invite": int(get_supabase_document_payload(document).get("invite") or 0),
                 "manual_category": clean_value(get_supabase_document_payload(document).get("manual_category")),
+                "manual_raw_response": clean_value(get_supabase_document_payload(document).get("manual_raw_response")),
                 "follow_up_note": clean_value(get_supabase_document_payload(document).get("follow_up_note")),
             }
             for document in store.fetch_documents(
@@ -1867,8 +1894,10 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
             keys = result["member_key"].dropna().astype(str).tolist()
             placeholders = ",".join("?" for _ in keys)
             member_query = f"SELECT member_key, age_text, sex, function_name FROM members WHERE member_key IN ({placeholders})"
+            override_columns = sqlite_table_columns(connection, "event_member_overrides")
+            manual_raw_select = "manual_raw_response" if "manual_raw_response" in override_columns else "'' AS manual_raw_response"
             override_query = (
-                f"SELECT member_key, invite, manual_category, follow_up_note "
+                f"SELECT member_key, invite, manual_category, {manual_raw_select}, follow_up_note "
                 f"FROM event_member_overrides WHERE event_name = ? AND member_key IN ({placeholders})"
             )
             stored_rows = connection.execute(member_query, keys).fetchall() if keys else []
@@ -1885,11 +1914,16 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
             "function_name": "fonction_db",
         }
     )
-    overrides = pd.DataFrame([dict(row) for row in override_rows]) if override_rows else pd.DataFrame(columns=["member_key", "invite", "manual_category", "follow_up_note"])
+    overrides = (
+        pd.DataFrame([dict(row) for row in override_rows])
+        if override_rows
+        else pd.DataFrame(columns=["member_key", "invite", "manual_category", "manual_raw_response", "follow_up_note"])
+    )
     overrides = overrides.rename(
         columns={
             "invite": "invite_db",
             "manual_category": "categorie_manuelle_db",
+            "manual_raw_response": "reponse_brute_manuelle_db",
             "follow_up_note": "commentaire_suivi_db",
         }
     )
@@ -1904,6 +1938,7 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
     result["fonction"] = result["fonction_db"].where(result["fonction_db"].ne(""), result["fonction"])
     result["invite"] = result["invite_db"].fillna(0).astype(int).astype(bool)
     result["categorie_manuelle"] = result["categorie_manuelle_db"].fillna("").map(clean_value)
+    result["reponse_brute_manuelle"] = result["reponse_brute_manuelle_db"].fillna("").map(clean_value)
     result["commentaire_suivi"] = result["commentaire_suivi_db"].fillna("").map(clean_value)
 
     return result.drop(
@@ -1913,6 +1948,7 @@ def sync_reference_members(reference_data: pd.DataFrame, event_name: str) -> pd.
             "fonction_db",
             "invite_db",
             "categorie_manuelle_db",
+            "reponse_brute_manuelle_db",
             "commentaire_suivi_db",
         ],
         errors="ignore",
@@ -1929,14 +1965,16 @@ def save_member_updates(event_name: str, updates: pd.DataFrame) -> None:
         member_key = clean_value(row.get("member_key"))
         if not member_key:
             continue
-        manual_category = clean_value(row.get("Décision manuelle"))
-        if manual_category == "Automatique":
-            manual_category = ""
+        manual_category, manual_raw_response = parse_manual_decision(
+            row.get("Décision manuelle"),
+            row.get("Réponse libre manuelle"),
+        )
         payload.append(
             (
                 clean_value(event_name),
                 1 if bool(row.get("Invité")) else 0,
                 manual_category,
+                manual_raw_response,
                 clean_value(row.get("Commentaire suivi")),
                 member_key,
             )
@@ -1954,10 +1992,11 @@ def save_member_updates(event_name: str, updates: pd.DataFrame) -> None:
                         "member_key": member_key,
                         "invite": invite,
                         "manual_category": manual_category,
+                        "manual_raw_response": manual_raw_response,
                         "follow_up_note": follow_up_note,
                     },
                 )
-                for current_event_name, invite, manual_category, follow_up_note, member_key in payload
+                for current_event_name, invite, manual_category, manual_raw_response, follow_up_note, member_key in payload
             ]
         )
         return
@@ -1968,14 +2007,16 @@ def save_member_updates(event_name: str, updates: pd.DataFrame) -> None:
                 event_name,
                 invite,
                 manual_category,
+                manual_raw_response,
                 follow_up_note,
                 member_key,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(event_name, member_key) DO UPDATE SET
                 invite = excluded.invite,
                 manual_category = excluded.manual_category,
+                manual_raw_response = excluded.manual_raw_response,
                 follow_up_note = excluded.follow_up_note,
                 updated_at = CURRENT_TIMESTAMP
         """
@@ -2112,6 +2153,62 @@ def is_selected_marker(value: Any) -> bool:
 def extract_selected_options(row: pd.Series, poll_columns: list[str]) -> list[str]:
     """Retourne toutes les options marquées X pour une ligne donnée."""
     return [column for column in poll_columns if is_selected_marker(row.get(column, ""))]
+
+
+def parse_response_values(value: Any) -> list[str]:
+    """Transforme un texte libre en liste de réponses sans doublons."""
+    text = clean_value(value)
+    if not text:
+        return []
+    parts = re.split(r"\s*\|\s*|\r?\n+", text)
+    return merge_unique_values(parts)
+
+
+def format_response_values(values: list[Any]) -> str:
+    """Formate une liste de réponses pour l'affichage et l'export."""
+    return RESPONSE_VALUE_SEPARATOR.join(merge_unique_values(values))
+
+
+def build_manual_decision_options(poll_columns: list[str]) -> list[str]:
+    """Construit les choix possibles du suivi manuel à partir du sondage."""
+    cleaned_poll_columns = merge_unique_values(poll_columns)
+    option_labels = [f"{MANUAL_DECISION_OPTION_PREFIX}{option}" for option in cleaned_poll_columns]
+    forced_labels = [f"{MANUAL_DECISION_FORCE_PREFIX}{category}" for category in FORCED_MANUAL_CATEGORIES]
+    return [MANUAL_DECISION_AUTOMATIC, *option_labels, MANUAL_DECISION_FREE_TEXT, *forced_labels]
+
+
+def resolve_manual_decision(manual_category: Any, manual_raw_response: Any, poll_columns: list[str]) -> tuple[str, str]:
+    """Traduit les overrides stockés vers l'éditeur manuel."""
+    category = clean_value(manual_category)
+    raw_response = clean_value(manual_raw_response)
+    normalized_poll_columns = set(merge_unique_values(poll_columns))
+
+    if category:
+        return f"{MANUAL_DECISION_FORCE_PREFIX}{category}", ""
+
+    if raw_response:
+        parsed_values = parse_response_values(raw_response)
+        if len(parsed_values) == 1 and parsed_values[0] in normalized_poll_columns:
+            return f"{MANUAL_DECISION_OPTION_PREFIX}{parsed_values[0]}", ""
+        return MANUAL_DECISION_FREE_TEXT, raw_response
+
+    return MANUAL_DECISION_AUTOMATIC, ""
+
+
+def parse_manual_decision(decision: Any, free_text_response: Any) -> tuple[str, str]:
+    """Convertit la décision de l'éditeur vers le stockage interne."""
+    selected_decision = clean_value(decision)
+    free_text = clean_value(free_text_response)
+
+    if not selected_decision or selected_decision == MANUAL_DECISION_AUTOMATIC:
+        return "", ""
+    if selected_decision == MANUAL_DECISION_FREE_TEXT:
+        return "", free_text
+    if selected_decision.startswith(MANUAL_DECISION_OPTION_PREFIX):
+        return "", clean_value(selected_decision.removeprefix(MANUAL_DECISION_OPTION_PREFIX))
+    if selected_decision.startswith(MANUAL_DECISION_FORCE_PREFIX):
+        return clean_value(selected_decision.removeprefix(MANUAL_DECISION_FORCE_PREFIX)), ""
+    return "", free_text
 
 
 def merge_unique_values(values: list[Any], preferred_order: list[str] | None = None) -> list[str]:
@@ -2255,7 +2352,7 @@ def build_whatsapp_vote_rows(
             "telephone_whatsapp_valide": normalized.map(lambda item: item[1]),
             "telephone_whatsapp_detail": normalized.map(lambda item: item[2]),
             "reponses_detectees_liste": selected_options,
-            "reponses_brutes_detectees": selected_options.map(lambda item: " | ".join(item)),
+            "reponses_brutes_detectees": selected_options.map(format_response_values),
             "ligne_resume": summary_mask,
             "numero_ligne_source": pd.Series(range(2, len(votes_df) + 2), index=votes_df.index),
             "anomalie_whatsapp": "",
@@ -2318,7 +2415,7 @@ def aggregate_whatsapp_votes(
                 "telephone_whatsapp_original": " | ".join(original_phones),
                 "telephone_whatsapp_normalise": phone_number,
                 "reponses_detectees_liste": selected_options,
-                "reponses_brutes_detectees": " | ".join(selected_options),
+                "reponses_brutes_detectees": format_response_values(selected_options),
                 "doublon_whatsapp": vote_count,
                 "anomalie_whatsapp": anomaly,
             }
@@ -2338,7 +2435,7 @@ def categorize_response(
         return "Pas de réponse"
 
     if analysis_mode == ANALYSIS_MODE_FREE:
-        return " | ".join(selected_options) if selected_options else "Réponse vide"
+        return format_response_values(selected_options) if selected_options else "Réponse vide"
 
     if not selected_options:
         return "Autre"
@@ -2390,16 +2487,32 @@ def merge_votes_with_reference(
     merged["reponses_detectees_liste"] = merged["reponses_detectees_liste"].apply(
         lambda value: value if isinstance(value, list) else []
     )
+    if "reponse_brute_manuelle" not in merged.columns:
+        merged["reponse_brute_manuelle"] = ""
+    merged["reponse_brute_manuelle"] = merged["reponse_brute_manuelle"].fillna("").map(clean_value)
+    merged["reponses_detectees_liste"] = merged.apply(
+        lambda row: parse_response_values(row["reponse_brute_manuelle"])
+        if row["reponse_brute_manuelle"]
+        else row["reponses_detectees_liste"],
+        axis=1,
+    )
+    merged["reponses_brutes_detectees"] = merged.apply(
+        lambda row: row["reponse_brute_manuelle"]
+        if row["reponse_brute_manuelle"]
+        else format_response_values(row["reponses_detectees_liste"]),
+        axis=1,
+    )
 
     if "doublon_whatsapp" not in merged.columns:
         merged["doublon_whatsapp"] = 0
     merged["doublon_whatsapp"] = merged["doublon_whatsapp"].fillna(0).astype(int)
 
-    merged["a_vote"] = merged["telephone_whatsapp_normalise"].ne("")
+    merged["a_vote_source"] = merged["telephone_whatsapp_normalise"].ne("")
+    merged["a_vote"] = merged["a_vote_source"] | merged["reponse_brute_manuelle"].ne("")
     merged["statut_reponse_source"] = merged.apply(
         lambda row: "Téléphone invalide"
         if not row["telephone_reference_valide"]
-        else ("A répondu" if row["a_vote"] else "Pas de réponse"),
+        else ("A répondu" if row["a_vote_source"] else "Pas de réponse"),
         axis=1,
     )
     merged["categorie_automatique"] = merged.apply(
@@ -2418,14 +2531,19 @@ def merge_votes_with_reference(
         axis=1,
     )
     merged["statut_reponse"] = merged["statut_reponse_source"]
+    manual_adjustment_mask = merged["categorie_manuelle"].ne("") | merged["reponse_brute_manuelle"].ne("")
     merged.loc[
-        merged["categorie_manuelle"].ne("") & merged["statut_reponse_source"].eq("Pas de réponse"),
+        manual_adjustment_mask & merged["statut_reponse_source"].eq("Pas de réponse"),
         "statut_reponse",
     ] = "Mis à jour manuellement"
     merged.loc[
-        merged["categorie_manuelle"].ne("") & merged["statut_reponse_source"].eq("A répondu"),
+        manual_adjustment_mask & merged["statut_reponse_source"].eq("A répondu"),
         "statut_reponse",
     ] = "A répondu (ajusté manuellement)"
+    merged.loc[
+        manual_adjustment_mask & merged["statut_reponse_source"].eq("Téléphone invalide"),
+        "statut_reponse",
+    ] = "Téléphone invalide (ajusté manuellement)"
 
     merged["commentaire_anomalie"] = merged["anomalie_reference"].fillna("")
     merged["commentaire_anomalie"] = merged.apply(
@@ -2542,7 +2660,7 @@ def prepare_unknown_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             "nom_whatsapp": "Nom WhatsApp",
             "telephone_whatsapp_original": "Téléphone original WhatsApp",
             "telephone_whatsapp_normalise": "Téléphone normalisé WhatsApp",
-            "reponses_brutes_detectees": "Réponses brutes détectées",
+            "reponses_brutes_detectees": "Réponses brutes",
             "categorie_finale": "Catégorie finale",
             "statut_reponse": "Statut réponse",
             "commentaire_anomalie": "Commentaire anomalie",
@@ -2718,7 +2836,7 @@ def build_report_pdf(results: dict[str, Any]) -> bytes:
     story.append(Spacer(1, 0.5 * cm))
 
     story.append(Paragraph("Synthèse par option de réponse", styles["Heading2"]))
-    story.append(Paragraph("Comptage des votes WhatsApp valides après dédoublonnage.", styles["Normal"]))
+    story.append(Paragraph("Comptage par option après dédoublonnage et prise en compte des ajustements manuels.", styles["Normal"]))
     story.append(Spacer(1, 0.1 * cm))
     if option_summary_df.empty:
         story.append(Paragraph("Aucune option de réponse détectée.", styles["Normal"]))
@@ -2957,12 +3075,24 @@ def process_files(
         poll_columns,
         duplicate_strategy,
     )
-    option_summary = build_response_option_summary(aggregated_votes, poll_columns)
     merged = merge_votes_with_reference(reference_data, aggregated_votes, analysis_mode, category_mapping)
     merged = merged.sort_values(by=["nom_complet", "prenom", "nom"], na_position="last").reset_index(drop=True)
 
     unknown_votes = build_unknown_votes(aggregated_votes, reference_data, analysis_mode, category_mapping)
     unknown_votes = unknown_votes.sort_values(by=["nom_whatsapp", "telephone_whatsapp_normalise"], na_position="last").reset_index(drop=True)
+    unknown_summary_source = (
+        unknown_votes[["reponses_detectees_liste"]].copy()
+        if "reponses_detectees_liste" in unknown_votes.columns
+        else pd.DataFrame(columns=["reponses_detectees_liste"])
+    )
+    combined_votes = pd.concat(
+        [
+            merged[["reponses_detectees_liste"]].copy(),
+            unknown_summary_source,
+        ],
+        ignore_index=True,
+    )
+    option_summary = build_response_option_summary(combined_votes, poll_columns)
 
     anomalies = build_anomalies(reference_data, aggregated_votes, invalid_votes)
     anomalies = anomalies.sort_values(by=["type_anomalie", "nom_concerne"], na_position="last").reset_index(drop=True)
@@ -2976,10 +3106,16 @@ def process_files(
     duplicate_whatsapp_numbers = int(aggregated_votes.loc[aggregated_votes["doublon_whatsapp"] > 1, "telephone_whatsapp_normalise"].nunique()) if not aggregated_votes.empty else 0
     invite_present_count = int((merged["invite"] & merged["categorie_finale"].eq("Présent")).sum())
     invite_absent_count = int((merged["invite"] & merged["categorie_finale"].eq("Absent")).sum())
+    manual_override_mask = (
+        merged["categorie_manuelle"].ne("")
+        | merged["reponse_brute_manuelle"].ne("")
+        | merged["commentaire_suivi"].ne("")
+        | merged["invite"]
+    )
 
     metrics = {
         "participants_total": len(merged),
-        "responded_count": int((merged["statut_reponse_source"] == "A répondu").sum()),
+        "responded_count": int(merged["categorie_finale"].ne("Pas de réponse").sum()),
         "present_count": int((merged["categorie_finale"] == "Présent").sum()),
         "absent_count": int((merged["categorie_finale"] == "Absent").sum()),
         "other_count": int((~merged["categorie_finale"].isin(["Présent", "Absent", "Pas de réponse"])).sum()),
@@ -2993,7 +3129,7 @@ def process_files(
         "invite_present_count": invite_present_count,
         "invite_absent_count": invite_absent_count,
         "present_with_invites_count": int((merged["categorie_finale"] == "Présent").sum()) + invite_present_count,
-        "manual_updates_count": int(merged["categorie_manuelle"].ne("").sum()),
+        "manual_updates_count": int(manual_override_mask.sum()),
     }
 
     results = {
@@ -3143,10 +3279,24 @@ def refresh_analysis(
     st.session_state[CURRENT_EVENT_SESSION_KEY] = saved_event_name
 
 
-def build_follow_up_editor_frame(data: pd.DataFrame) -> pd.DataFrame:
+def build_follow_up_editor_frame(data: pd.DataFrame, poll_columns: list[str]) -> pd.DataFrame:
     """Prépare la table éditable de suivi manuel."""
     editor = data.copy()
-    editor["Décision manuelle"] = editor["categorie_manuelle"].map(lambda value: clean_value(value) or "Automatique")
+    if "reponses_brutes_detectees" not in editor.columns:
+        editor["reponses_brutes_detectees"] = ""
+    if "reponse_brute_manuelle" not in editor.columns:
+        editor["reponse_brute_manuelle"] = ""
+    manual_resolution = editor.apply(
+        lambda row: resolve_manual_decision(
+            row.get("categorie_manuelle"),
+            row.get("reponse_brute_manuelle"),
+            poll_columns,
+        ),
+        axis=1,
+    )
+    editor["Décision manuelle"] = manual_resolution.map(lambda item: item[0])
+    editor["Réponses brutes"] = editor["reponses_brutes_detectees"].fillna("").map(clean_value)
+    editor["Réponse libre manuelle"] = manual_resolution.map(lambda item: item[1])
     editor["Invité"] = editor["invite"].fillna(False).astype(bool)
     editor["Commentaire suivi"] = editor["commentaire_suivi"].fillna("")
     editor = editor[
@@ -3158,7 +3308,9 @@ def build_follow_up_editor_frame(data: pd.DataFrame) -> pd.DataFrame:
             "sexe",
             "telephone_reference_original",
             "categorie_automatique",
+            "Réponses brutes",
             "Décision manuelle",
+            "Réponse libre manuelle",
             "categorie_finale",
             "statut_reponse",
             "Invité",
@@ -3796,12 +3948,12 @@ def main() -> None:
     metric_columns[3].metric("Téléphones invalides WhatsApp", metrics["invalid_whatsapp_count"])
 
     st.subheader("6. Synthèse des options de réponse")
-    st.caption("Comptage des votes WhatsApp valides après dédoublonnage.")
+    st.caption("Comptage par option après dédoublonnage et prise en compte des ajustements manuels.")
     st.dataframe(results["option_summary_export"], use_container_width=True, hide_index=True)
 
     st.subheader("7. Suivi manuel et relance")
     st.write(
-        "Utilisez ce tableau pour marquer une décision manuelle, cocher les invités et garder une note de suivi. "
+        "Utilisez ce tableau pour choisir une option réelle du sondage, saisir une réponse libre si besoin, cocher les invités et garder une note de suivi. "
         "Les modifications sont sauvegardées en base de données et réappliquées automatiquement au prochain lancement."
     )
     follow_up_filter_options = [
@@ -3835,6 +3987,7 @@ def main() -> None:
                     "sexe",
                     "telephone_reference_original",
                     "categorie_automatique",
+                    "reponses_brutes_detectees",
                     "categorie_finale",
                     "statut_reponse",
                     "commentaire_suivi",
@@ -3844,7 +3997,8 @@ def main() -> None:
         )
         follow_up_df = results["all_internal"].loc[results["all_internal"]["member_key"].isin(follow_up_df["member_key"])]
 
-    editor_df = build_follow_up_editor_frame(follow_up_df)
+    manual_decision_options = build_manual_decision_options(results.get("poll_columns", []))
+    editor_df = build_follow_up_editor_frame(follow_up_df, results.get("poll_columns", []))
     edited_follow_up = st.data_editor(
         editor_df,
         use_container_width=True,
@@ -3852,8 +4006,12 @@ def main() -> None:
         column_config={
             "Décision manuelle": st.column_config.SelectboxColumn(
                 "Décision manuelle",
-                options=MANUAL_CATEGORY_OPTIONS,
-                help="Choisissez une décision pour remplacer la catégorie automatique.",
+                options=manual_decision_options,
+                help="Choisissez une option réelle du sondage, une réponse libre, ou forcez une catégorie.",
+            ),
+            "Réponse libre manuelle": st.column_config.TextColumn(
+                "Réponse libre manuelle",
+                help="Utilisez ce champ seulement avec 'Réponse libre'. Pour plusieurs valeurs, séparez-les avec |.",
             ),
             "Invité": st.column_config.CheckboxColumn(
                 "Invité",
@@ -3867,13 +4025,16 @@ def main() -> None:
             "Sexe",
             "Téléphone",
             "Catégorie automatique",
+            "Réponses brutes",
             "Catégorie finale",
             "Statut réponse",
         ],
         key="follow_up_editor",
     )
     if st.button("Enregistrer les modifications du suivi", use_container_width=True):
-        updates = edited_follow_up.reset_index()[["member_key", "Décision manuelle", "Invité", "Commentaire suivi"]]
+        updates = edited_follow_up.reset_index()[
+            ["member_key", "Réponse libre manuelle", "Décision manuelle", "Invité", "Commentaire suivi"]
+        ]
         save_member_updates(current_event_name, updates)
         refresh_analysis(
             current_event_name,
